@@ -2,6 +2,16 @@
 #include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+template<typename T>
+__global__ void traceKernel(T* input, int rows, int cols, T* result) {
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;
+  
+  // 对角线元素数量是 min(rows, cols)
+  if (idx < rows && idx < cols) {
+    // 对角线元素：input[idx][idx] = input[idx * cols + idx]
+    atomicAdd(result, input[idx * cols + idx]);
+  }
+}
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +29,30 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  T* d_input;
+  cudaMalloc(&d_input, h_input.size() * sizeof(T));
+  
+  // ✅ 修复：使用正确的大小参数
+  cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice);
+  
+  T* d_result;
+  cudaMalloc(&d_result, sizeof(T));
+  cudaMemset(d_result, 0, sizeof(T));
+  
+  int blockSize = 32;
+  dim3 block(blockSize);
+  dim3 grid((min(rows, cols) + blockSize - 1) / blockSize);  // ✅ 这行正确
+  
+  traceKernel<<<grid, block>>>(d_input, rows, cols, d_result);
+  cudaDeviceSynchronize();  // 添加同步
+  
+  T result;
+  cudaMemcpy(&result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
+  
+  cudaFree(d_input);
+  cudaFree(d_result);
+  
+  return result;
 }
 
 /**
