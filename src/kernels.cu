@@ -6,26 +6,22 @@ template<typename T>
 __global__ void traceKernel(T* input, int rows, int cols, T* result) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   size_t tid = threadIdx.x;
-  unsigned int lane_id = tid % 32;  // 计算线程在 warp 内的 lane id
   int min_col = min(rows, cols);  // 使用较小的维度
   // 对角线元素数量是 min(rows, cols)
-  if (idx < min_col) {
-    if (lane_id == 0) {
-      T warp_num = 0;
-      printf("traceKernel - Processing diagonal element at index %d\n", idx);
-      for (int i = 0; i < 32; ++i) {
-        for (int j = idx + i; j < min_col; j += blockDim.x * blockIdx.x) {
-            warp_num += input[j * cols + j];
-        }
-      }
-      atomicAdd(result, warp_num);
-    }
-    // 对角线元素：input[idx][idx] = input[idx * cols + idx]
+  T sum = T(0);
+  for (int i = idx; i < min_col; i += blockDim.x * gridDim.x) {
+    sum += input[i * cols + i];  // 访问对角线元素
   }
+  for (int offset = 16; offset > 0; offset /= 2) {
+      sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+  }
+  if (tid % 32 == 0) {                                                                                                                                    
+      atomicAdd(result, sum);                                                                                                                             
+  }     
 }
 
 /**
- * @brief Computes the trace of a matrix.
+ * @br‘ief Computes the trace of a matrix.
  *
  * The trace of a matrix is defined as the sum of its diagonal elements.
  * This function expects a flattened row-major matrix stored in a
