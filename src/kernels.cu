@@ -2,8 +2,16 @@
 #include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+  template<typename T> 
+  __device__ T warp_reduce(T val){
+      for(int offset = 16; offset > 0; offset >>= 1){
+          val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+      }
+      return val;
+  }
 template<typename T>
 __global__ void traceKernel(T* input, int rows, int cols, T* result) {
+  __shared__ T trace_smem[32];  // 静态分配，最多支持1024线程的block
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   size_t tid = threadIdx.x;
   int min_col = min(rows, cols);  // 使用较小的维度
@@ -12,12 +20,18 @@ __global__ void traceKernel(T* input, int rows, int cols, T* result) {
   for (int i = idx; i < min_col; i += blockDim.x * gridDim.x) {
     sum += input[i * cols + i];  // 访问对角线元素
   }
-  for (int offset = 16; offset > 0; offset /= 2) {
-      sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+  T warp_sum = warp_reduce(sum);
+  if (tid % 32 == 0) {
+      trace_smem[tid / 32] = warp_sum;
   }
-  if (tid % 32 == 0) {                                                                                                                                    
-      atomicAdd(result, sum);                                                                                                                             
-  }     
+  __syncthreads();
+  if (tid < blockDim.x / 32) {
+      T block_sum = (tid < (blockDim.x + 31) / 32) ? trace_smem[tid] : T(0);                                                                                                               
+      T total = warp_reduce(block_sum);                                                                                                                 
+      if (tid == 0) {                                                                                                                                   
+          atomicAdd(result, total);
+      }
+    }    
 }
 
 /**
@@ -50,6 +64,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   dim3 block(blockSize);
   dim3 grid((min(rows, cols) + blockSize - 1) / blockSize);  // ✅ 这行正确
   //使用较小值是因为对角线元素数量是 min(rows, cols)
+  // 静态分配shared memory，不需要第三个参数
   traceKernel<<<grid, block>>>(d_input, rows, cols, d_result);
   cudaDeviceSynchronize();  // 添加同步
   
@@ -114,13 +129,13 @@ __global__ void flashAttentionKernel(
   // 2. 共享内存：用于存储分块数据
   // ========================================
   // FlashAttention 的核心：将大的注意力矩阵分块加载到共享内存
-  extern __shared__ float smem[];
+  extern __shared__ float flash_smem[];
 
   // 共享内存布局：
   // - Q_tile: [head_dim] - 当前 query 向量
   // - K_tile: [BLOCK_SIZE, head_dim] - 分块的 key 矩阵
   // - V_tile: [BLOCK_SIZE, head_dim] - 分块的 value 矩阵
-  float* Q_tile = smem;
+  float* Q_tile = flash_smem;
   float* K_tile = Q_tile + head_dim;
   float* V_tile = K_tile + blockDim.y * head_dim;
 
