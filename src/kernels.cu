@@ -1,4 +1,5 @@
 #include <vector>
+#include <algorithm>
 #include <cuda_fp16.h>
 
 #include "../tester/utils.h"
@@ -9,16 +10,16 @@
       }
       return val;
   }
+// 优化版：只处理对角线数据，输入应该是对角线元素的一维数组
 template<typename T>
-__global__ void traceKernel(T* input, int rows, int cols, T* result) {
-  __shared__ T trace_smem[32];  // 静态分配，最多支持1024线程的block
+__global__ void traceKernel(T* diagonal, int diag_size, T* result) {
+  __shared__ T trace_smem[32];
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   size_t tid = threadIdx.x;
-  int min_col = min(rows, cols);  // 使用较小的维度
-  // 对角线元素数量是 min(rows, cols)
+
   T sum = T(0);
-  for (int i = idx; i < min_col; i += blockDim.x * gridDim.x) {
-    sum += input[i * cols + i];  // 访问对角线元素
+  for (int i = idx; i < diag_size; i += blockDim.x * gridDim.x) {
+    sum += diagonal[i];  // 直接访问对角线元素
   }
   T warp_sum = warp_reduce(sum);
   if (tid % 32 == 0) {
@@ -50,30 +51,36 @@ __global__ void traceKernel(T* input, int rows, int cols, T* result) {
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  T* d_input;
-  cudaMalloc(&d_input, h_input.size() * sizeof(T));
-  
-  // ✅ 修复：使用正确的大小参数
-  cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice);
-  
+  // 优化：在 host 端先提取对角线元素，减少数据传输
+  size_t diag_size = std::min(rows, cols);
+  std::vector<T> h_diagonal(diag_size);
+
+  for (size_t i = 0; i < diag_size; ++i) {
+    h_diagonal[i] = h_input[i * cols + i];  // 提取对角线元素
+  }
+
+  // 只传输对角线数据，而非整个矩阵
+  T* d_diagonal;
+  cudaMalloc(&d_diagonal, diag_size * sizeof(T));
+  cudaMemcpy(d_diagonal, h_diagonal.data(), diag_size * sizeof(T), cudaMemcpyHostToDevice);
+
   T* d_result;
   cudaMalloc(&d_result, sizeof(T));
   cudaMemset(d_result, 0, sizeof(T));
-  
-  int blockSize = 32;
+
+  int blockSize = 256;
   dim3 block(blockSize);
-  dim3 grid((min(rows, cols) + blockSize - 1) / blockSize);  // ✅ 这行正确
-  //使用较小值是因为对角线元素数量是 min(rows, cols)
-  // 静态分配shared memory，不需要第三个参数
-  traceKernel<<<grid, block>>>(d_input, rows, cols, d_result);
-  cudaDeviceSynchronize();  // 添加同步
-  
+  dim3 grid((diag_size + blockSize - 1) / blockSize);
+
+  traceKernel<<<grid, block>>>(d_diagonal, diag_size, d_result);
+  cudaDeviceSynchronize();
+
   T result;
   cudaMemcpy(&result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
-  
-  cudaFree(d_input);
+
+  cudaFree(d_diagonal);
   cudaFree(d_result);
-  
+
   return result;
 }
 
