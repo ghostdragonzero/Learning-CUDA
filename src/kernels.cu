@@ -127,26 +127,18 @@ __global__ void flashAttentionKernel(
   // 处理 GQA (Grouped Query Attention)：多个 query heads 共享一组 kv heads
   int kv_head_id = q_head_id / (query_heads / kv_heads);
 
-  // threadIdx.x 处理 head_dim 的计算
-  // 每个线程可能需要处理多个元素（如果 head_dim > blockDim.x）
+  // threadIdx.x 处理 head_dim 的计算 (head_dim=32, blockDim.x=32, 每个线程处理一个元素)
   int tid = threadIdx.x;
   int threads_x = blockDim.x;
 
   // ========================================
-  // 2. 共享内存：用于存储分块数据
+  // 2. 共享内存：存储 query 向量和输出向量
   // ========================================
-  // FlashAttention 的核心：将大的注意力矩阵分块加载到共享内存
-  extern __shared__ float flash_smem[];
-
-  // 共享内存布局：
-  // - Q_tile: [head_dim] - 当前 query 向量
-  // - K_tile: [BLOCK_SIZE, head_dim] - 分块的 key 矩阵
-  // - V_tile: [BLOCK_SIZE, head_dim] - 分块的 value 矩阵
-  float* Q_tile = flash_smem;
-  float* K_tile = Q_tile + head_dim;
-  float* V_tile = K_tile + blockDim.y * head_dim;
-
-  const int BLOCK_SIZE = blockDim.y;  // K/V 分块大小
+  // 使用足够大的数组以支持不同的 head_dim 值
+  __shared__ float Q_tile[128];   // 当前 query 向量
+  __shared__ float O_tile[128];   // 累积输出向量
+  __shared__ float max_score_shared;  // 共享的最大分数
+  __shared__ float sum_exp_shared;    // 共享的指数和
 
   // ========================================
   // 3. 加载当前 query 向量到共享内存
@@ -154,140 +146,80 @@ __global__ void flashAttentionKernel(
   // Q 的索引计算: [batch_id, tgt_pos, q_head_id, :]
   int q_offset = ((batch_id * target_seq_len + tgt_pos) * query_heads + q_head_id) * head_dim;
 
-  // 每个线程加载多个元素（如果 head_dim > threads_x）
-  for (int d = tid; d < head_dim; d += threads_x) {
-    Q_tile[d] = float(q[q_offset + d]);
-  }
+  // head_dim = 32 = threads_x, 每个线程加载一个元素
+  Q_tile[tid] = float(q[q_offset + tid]);
+    // 初始化输出为 0
+  O_tile[tid] = 0.0f;
+  //把这个Q向量保存起来
 
   __syncthreads();  // 等待所有线程完成 Q 的加载
 
   // ========================================
-  // 4. FlashAttention 的核心循环：分块处理 K 和 V
+  // 4. FlashAttention 的核心循环：遍历所有 key-value pairs
   // ========================================
-  // 维护在线 softmax 的统计量：
-  // - o_curr: 当前累积的输出向量 [head_dim]
-  // - m_curr: 当前最大的注意力分数（用于 softmax 的数值稳定性）
-  // - l_curr: 当前累积的 softmax 分母（指数和）
+  // 使用朴素的两阶段方法：先收集所有注意力分数，再计算 softmax
 
-  float* o_curr = Q_tile;  // 复用 Q_tile 的空间来存储输出
-  float m_curr = -INFINITY;
-  float l_curr = 0.0f;
+  // 第一阶段：计算所有注意力分数并找到最大值
+  __shared__ float S_tile[4096];  // 最多支持 4096 的序列长度
 
-  // 初始化输出为 0
-  for (int d = tid; d < head_dim; d += threads_x) {
-    o_curr[d] = 0.0f;
-  }
-
-  __syncthreads();  // 等待所有线程完成初始化
-
-  // 遍历所有 K/V 分块
-  for (int k_block_start = 0; k_block_start < src_seq_len; k_block_start += BLOCK_SIZE) {
-
-    // ----------------------------------------
-    // 4.1 加载 K 和 V 的当前分块到共享内存
-    // ----------------------------------------
-    int k_block_end = min(k_block_start + BLOCK_SIZE, src_seq_len);
-    int actual_block_size = k_block_end - k_block_start;
-
-    // 每个线程加载 K_tile 和 V_tile 的一部分
-    // K_tile[k_idx][d] = K[batch_id, k_pos, kv_head_id, d]
-    // V_tile[k_idx][d] = V[batch_id, k_pos, kv_head_id, d]
-
-    for (int k_idx = 0; k_idx < actual_block_size; k_idx++) {
-      int k_pos = k_block_start + k_idx;
-
-      // 计算 K 和 V 的全局索引
-      int kv_offset = ((batch_id * src_seq_len + k_pos) * kv_heads + kv_head_id) * head_dim;
-
-      // 每个线程加载多个元素
-      for (int d = tid; d < head_dim; d += threads_x) {
-        K_tile[k_idx * head_dim + d] = float(k[kv_offset + d]);
-        V_tile[k_idx * head_dim + d] = float(v[kv_offset + d]);
-      }
-    }
-
-    __syncthreads();  // 等待所有线程完成加载
-
-    // ----------------------------------------
-    // 4.2 计算当前分块的注意力分数
-    // ----------------------------------------
-    // Q @ K^T: query 与当前分块中所有 key 的点积
-    // S[j] = Q · K[j]^T / sqrt(head_dim)
-
-    for (int k_idx = 0; k_idx < actual_block_size; k_idx++) {
-      int k_pos = k_block_start + k_idx;
-
+  if (tid == 0) {
+    max_score_shared = -INFINITY;
+    for (int k_pos = 0; k_pos < src_seq_len; k_pos++) {
       // Causal masking: 只能注意之前的位置（包括自己）
       if (is_causal && k_pos > tgt_pos) {
+        S_tile[k_pos] = -INFINITY;
         continue;
       }
 
-      // 计算 Q · K[j]^T (点积) - 使用归约操作
+      // 计算 K 的偏移量
+      int k_offset = ((batch_id * src_seq_len + k_pos) * kv_heads + kv_head_id) * head_dim;
+
+      // 计算注意力分数: Q · K^T / sqrt(head_dim)
       float s_ij = 0.0f;
-      for (int d = tid; d < head_dim; d += threads_x) {
-        s_ij += Q_tile[d] * K_tile[k_idx * head_dim + d];
+      for (int d = 0; d < head_dim; d++) {
+        s_ij += Q_tile[d] * float(k[k_offset + d]);
       }
+      s_ij /= sqrtf(float(head_dim));
 
-      // 线程间归约求和（得到完整的点积）
-      for (int stride = threads_x / 2; stride > 0; stride /= 2) {
-        s_ij += __shfl_down_sync(0xFFFFFFFF, s_ij, stride);
-      }
-
-      // 只有 tid=0 的线程持有完整的点积结果，广播给所有线程
-      s_ij = __shfl_sync(0xFFFFFFFF, s_ij, 0);
-      s_ij *= __frsqrt_rn(float(head_dim));  // 除以 sqrt(head_dim)
-
-      // ----------------------------------------
-      // 4.3 在线 softmax 更新 (FlashAttention 核心)
-      // ----------------------------------------
-      // 使用新的注意力分数 s_ij 更新统计量：
-      // - m_new = max(m_curr, s_ij)
-      // - l_new = exp(m_curr - m_new) * l_curr + exp(s_ij - m_new)
-      // - o_new = exp(m_curr - m_new) * o_curr + exp(s_ij - m_new) * V[j]
-
-      float m_new = max(m_curr, s_ij);
-
-      // 计算新的归一化因子
-      float l_new = expf(m_curr - m_new) * l_curr + expf(s_ij - m_new);
-
-      // 更新输出向量（注意：这里不除以 l_new，而是在最后统一除）
-      for (int d = tid; d < head_dim; d += threads_x) {
-        float o_new = expf(m_curr - m_new) * o_curr[d] + expf(s_ij - m_new) * V_tile[k_idx * head_dim + d];
-        o_curr[d] = o_new;
-      }
-
-      // 更新统计量
-      m_curr = m_new;
-      l_curr = l_new;
-    }
-
-    __syncthreads();  // 等待所有线程完成当前分块的计算
-  }
-
-  // ========================================
-  // 5. 最终归一化：除以累积的 softmax 分母
-  // ========================================
-  // 注意：如果 l_curr 仍然是 0（例如 causal masking 时没有有效位置），
-  // 输出应该保持为 0 或设置为一个默认值
-  if (l_curr > 0.0f) {
-    for (int d = tid; d < head_dim; d += threads_x) {
-      o_curr[d] = o_curr[d] / l_curr;
-    }
-  } else {
-    // 没有有效的 attention，输出保持为 0
-    for (int d = tid; d < head_dim; d += threads_x) {
-      o_curr[d] = 0.0f;
+      S_tile[k_pos] = s_ij;
+      max_score_shared = fmaxf(max_score_shared, s_ij);
     }
   }
+
+  __syncthreads();
+
+  // 第二阶段：计算 softmax 的指数和（tid=0 计算）
+  if (tid == 0) {
+    sum_exp_shared = 0.0f;
+    for (int k_pos = 0; k_pos < src_seq_len; k_pos++) {
+      if (S_tile[k_pos] > -INFINITY / 2) {  // 有效位置
+        sum_exp_shared += expf(S_tile[k_pos] - max_score_shared);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // 第三阶段：计算最终输出
+  for (int k_pos = 0; k_pos < src_seq_len; k_pos++) {
+    if (S_tile[k_pos] > -INFINITY / 2) {  // 有效位置
+      int v_offset = ((batch_id * src_seq_len + k_pos) * kv_heads + kv_head_id) * head_dim;
+      float weight = expf(S_tile[k_pos] - max_score_shared) / sum_exp_shared;
+      O_tile[tid] += weight * float(v[v_offset + tid]);
+    }
+  }
+
+  __syncthreads();
+
+  // ========================================
+  // 5. 输出已经归一化，直接写回
+  // ========================================
 
   // ========================================
   // 6. 将结果写回全局内存
   // ========================================
   int o_offset = ((batch_id * target_seq_len + tgt_pos) * query_heads + q_head_id) * head_dim;
-
-  for (int d = tid; d < head_dim; d += threads_x) {
-    o[o_offset + d] = T(o_curr[d]);
-  }
+  o[o_offset + tid] = T(O_tile[tid]);
 }
 
 template <typename T>
@@ -318,45 +250,28 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
 
   // 4. 配置 kernel 启动参数
-  // 简化版本：使用固定的分块大小
-  const int BLOCK_SIZE_KV = 32;  // K/V 分块大小
-
   // 线程数必须是 2 的幂，用于 warp shuffle
   int threads_x = 32;
+  if (head_dim < 32) {
+    threads_x = head_dim;
+  }
+  
 
 
-  dim3 block(threads_x, BLOCK_SIZE_KV);
+  dim3 block(threads_x);
   dim3 grid(batch_size, query_heads, target_seq_len);
-
-  // 计算共享内存大小
-  size_t smem_size = (head_dim + BLOCK_SIZE_KV * head_dim * 2) * sizeof(float);
 
   // ========================================
   // 打印线程配置并验证硬件限制
   // ========================================
+  /*
   printf("\n========== flashAttentionKernel Launch Configuration ==========\n");
   printf("Problem size: batch=%d, tgt_seq=%d, src_seq=%d, q_heads=%d, kv_heads=%d, head_dim=%d\n",
          batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim);
-  printf("Block dimensions: (%d, %d, %d)\n", block.x, block.y, block.z);
-  printf("Grid dimensions: (%d, %d, %d)\n", grid.x, grid.y, grid.z);
-  printf("Threads per block: %d\n", block.x * block.y * block.z);
-  printf("Total blocks: %d\n", grid.x * grid.y * grid.z);
-  printf("Shared memory per block: %zu bytes\n", smem_size);
-  printf("\nHardware Limits Check:\n");
-  printf("  ✓ Max threads per block: 1024 [Current: %d %s]\n",
-         block.x * block.y * block.z,
-         (block.x * block.y * block.z <= 1024) ? "PASS" : "FAIL");
-  printf("  ✓ Max block dimensions: 1024 x 1024 x 64 [Current: %d x %d x %d %s]\n",
-         block.x, block.y, block.z,
-         (block.x <= 1024 && block.y <= 1024 && block.z <= 64) ? "PASS" : "FAIL");
-  printf("  ✓ Max grid dimensions: 2147483647 x 65535 x 65535 [Current: %d x %d x %d %s]\n",
-         grid.x, grid.y, grid.z,
-         (grid.x <= 2147483647 && grid.y <= 65535 && grid.z <= 65535) ? "PASS" : "FAIL");
-  printf("  ✓ Max threads per SM: 1536 [Need device query for SM count to verify]\n");
   printf("==============================================================\n\n");
-
+*/
   // 5. 启动 kernel
-  flashAttentionKernel<T><<<grid, block, smem_size>>>(
+  flashAttentionKernel<T><<<grid, block>>>(
       d_q, d_k, d_v, d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
