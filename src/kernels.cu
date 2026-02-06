@@ -211,13 +211,8 @@ __global__ void flashAttentionKernel(
 
   __syncthreads();
 
-  // ========================================
-  // 5. 输出已经归一化，直接写回
-  // ========================================
-
-  // ========================================
   // 6. 将结果写回全局内存
-  // ========================================
+
   int o_offset = ((batch_id * target_seq_len + tgt_pos) * query_heads + q_head_id) * head_dim;
   o[o_offset + tid] = T(O_tile[tid]);
 }
@@ -227,10 +222,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
-
-  // ========================================
-  // 主机端函数：内存分配和内核启动
-  // ========================================
 
   // 1. 计算数据大小
   size_t q_size = batch_size * target_seq_len * query_heads * head_dim;
@@ -250,20 +241,18 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
 
   // 4. 配置 kernel 启动参数
-  // 线程数必须是 2 的幂，用于 warp shuffle
-  int threads_x = 32;
-  if (head_dim < 32) {
-    threads_x = head_dim;
-  }
+
+
+  int threads_x = head_dim;
+  //打印了配置都是2的倍数
+  
   
 
 
   dim3 block(threads_x);
   dim3 grid(batch_size, query_heads, target_seq_len);
 
-  // ========================================
-  // 打印线程配置并验证硬件限制
-  // ========================================
+
   /*
   printf("\n========== flashAttentionKernel Launch Configuration ==========\n");
   printf("Problem size: batch=%d, tgt_seq=%d, src_seq=%d, q_heads=%d, kv_heads=%d, head_dim=%d\n",
